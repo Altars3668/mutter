@@ -1,0 +1,234 @@
+Description: 拼接屏某块 tile 迟到时，若兄弟 tile 已排同一 vblank 则立即提交
+ 拼接屏（DisplayID tiled，如双 DP 4K 高刷）的每块 tile 是独立的 view、frame
+ clock 和 CRTC，更新逐 CRTC 提交，各有自己的 KMS deadline。两块 tile 在主线程
+ 先后绘制，就绪相差约 0.2 ms；deadline 恰好落在两者之间时，一块在本次 vblank
+ 翻帧，另一块被整帧推迟，中缝处并排显示前后两帧，滚动时像撕裂。
+ .
+ 主平面更新错过 deadline、距被错过的 vblank 起点仍有至少 400 µs，且同组兄弟
+ tile 已为该 vblank 提交主平面翻帧时，改为立即提交。兄弟也迟到时保持原行为，
+ 各块一起推迟。非拼接输出、VRR 和带目标呈现时间的更新不受影响。
+ .
+ 同时修复 update_ready：deadline 无法布防时，不再使用可能已被 queue_update()
+ 合并并释放的 update 指针。
+Origin: downstream
+Forwarded: no
+Last-Update: 2026-10-04
+--- a/src/backends/native/meta-kms-impl-device.c
++++ b/src/backends/native/meta-kms-impl-device.c
+@@ -68,6 +68,7 @@ typedef struct _CrtcDeadline
+   MetaKmsUpdate *pending_update;
+   gboolean await_flush;
+   gboolean pending_page_flip;
++  gboolean pending_primary_flip;
+   int64_t kms_ready_time_us;
+ 
+   struct {
+@@ -1391,6 +1392,141 @@ arm_crtc_frame_deadline_timer (CrtcFrame
+   crtc_frame->deadline.armed = TRUE;
+ }
+ 
++/* 迟到的 tile 更新距被错过的那次 vblank 起点至少还剩这么久，才立即补交。
++ * 一次翻帧的显示管线编程实测远低于 100 µs。 */
++#define TILE_LATE_UPDATE_MIN_LEAD_US 400
++
++static MetaKmsCrtc *
++find_active_tile_crtc (MetaKmsImplDevice           *impl_device,
++                       const MetaKmsConnectorState *connector_state)
++{
++  MetaKmsImplDevicePrivate *priv =
++    meta_kms_impl_device_get_instance_private (impl_device);
++  const MetaTileInfo *tile_info = &connector_state->tile_info;
++  GList *l;
++
++  if (!connector_state->current_crtc_id ||
++      !tile_info->group_id ||
++      tile_info->max_h_tiles * tile_info->max_v_tiles <= 1)
++    return NULL;
++
++  for (l = priv->crtcs; l; l = l->next)
++    {
++      MetaKmsCrtc *crtc = l->data;
++      const MetaKmsCrtcState *state;
++
++      if (meta_kms_crtc_get_id (crtc) != connector_state->current_crtc_id)
++        continue;
++
++      state = meta_kms_crtc_get_current_state (crtc);
++      if (state->is_active && state->is_drm_mode_valid &&
++          !state->vrr.enabled &&
++          state->drm_mode.hdisplay == tile_info->tile_w &&
++          state->drm_mode.vdisplay == tile_info->tile_h)
++        return crtc;
++
++      return NULL;
++    }
++
++  return NULL;
++}
++
++static gboolean
++tile_sibling_has_pending_primary_flip (MetaKmsImplDevice *impl_device,
++                                       MetaKmsCrtc       *crtc)
++{
++  MetaKmsImplDevicePrivate *priv =
++    meta_kms_impl_device_get_instance_private (impl_device);
++  uint32_t group_id = 0;
++  GList *l;
++
++  for (l = priv->connectors; l; l = l->next)
++    {
++      const MetaKmsConnectorState *state =
++        meta_kms_connector_get_current_state (l->data);
++
++      if (state && find_active_tile_crtc (impl_device, state) == crtc)
++        {
++          group_id = state->tile_info.group_id;
++          break;
++        }
++    }
++
++  if (!group_id)
++    return FALSE;
++
++  for (l = priv->connectors; l; l = l->next)
++    {
++      const MetaKmsConnectorState *state =
++        meta_kms_connector_get_current_state (l->data);
++      MetaKmsCrtc *sibling;
++      CrtcFrame *sibling_frame;
++
++      if (!state || state->tile_info.group_id != group_id)
++        continue;
++
++      sibling = find_active_tile_crtc (impl_device, state);
++      if (!sibling || sibling == crtc)
++        continue;
++
++      sibling_frame = get_crtc_frame (impl_device, sibling);
++      if (sibling_frame && sibling_frame->pending_primary_flip)
++        return TRUE;
++    }
++
++  return FALSE;
++}
++
++static gboolean
++update_changes_primary_plane (MetaKmsUpdate *update,
++                              MetaKmsCrtc   *crtc)
++{
++  MetaKmsPlaneAssignment *assignment;
++
++  assignment = meta_kms_update_get_primary_plane_assignment (update, crtc);
++  return assignment &&
++         !(assignment->flags & META_KMS_ASSIGN_PLANE_FLAG_FB_UNCHANGED);
++}
++
++/*
++ * 拼接屏的每块 tile 由独立 CRTC 驱动，各有自己的 deadline。某块 tile 的更新在
++ * deadline 之后才就绪、而兄弟 tile 已为同一次 vblank 提交新帧时，若整帧推迟，
++ * 两侧就会并排显示前后两帧。只要还来得及在该 vblank 前完成编程，就立即提交。
++ * 兄弟 tile 也没赶上 deadline 时，各块一起推迟，仍保持同步。
++ */
++static gboolean
++should_post_late_tile_update (MetaKmsImplDevice *impl_device,
++                              CrtcFrame         *crtc_frame,
++                              int64_t            next_presentation_us)
++{
++  const MetaKmsCrtcState *crtc_state =
++    meta_kms_crtc_get_current_state (crtc_frame->crtc);
++  MetaKmsUpdate *update = crtc_frame->pending_update;
++  int64_t refresh_interval_us;
++  int64_t missed_vblank_start_us;
++
++  if (!update ||
++      meta_kms_update_get_target_presentation_time (update) ||
++      !update_changes_primary_plane (update, crtc_frame->crtc))
++    return FALSE;
++
++  if (!crtc_state->is_drm_mode_valid || crtc_state->vrr.enabled)
++    return FALSE;
++
++  refresh_interval_us =
++    (int64_t) (0.5 + G_USEC_PER_SEC /
++               meta_calculate_drm_mode_refresh_rate (&crtc_state->drm_mode));
++  missed_vblank_start_us =
++    next_presentation_us - refresh_interval_us -
++    meta_calculate_drm_mode_vblank_duration_us (&crtc_state->drm_mode);
++
++  if (missed_vblank_start_us - g_get_monotonic_time () <
++      TILE_LATE_UPDATE_MIN_LEAD_US)
++    return FALSE;
++
++  return tile_sibling_has_pending_primary_flip (impl_device, crtc_frame->crtc);
++}
++
+ static gboolean
+ ensure_deadline_timer_armed (MetaKmsImplDevice *impl_device,
+                              CrtcFrame         *crtc_frame)
+@@ -1435,6 +1571,15 @@ ensure_deadline_timer_armed (MetaKmsImpl
+       return FALSE;
+     }
+ 
++  if (should_post_late_tile_update (impl_device, crtc_frame,
++                                    next_presentation_us))
++    {
++      meta_topic (META_DEBUG_KMS_DEADLINE,
++                  "CRTC %u missed deadline, posting late tile update",
++                  meta_kms_crtc_get_id (crtc_frame->crtc));
++      return FALSE;
++    }
++
+   arm_crtc_frame_deadline_timer (crtc_frame,
+                                  next_deadline_us,
+                                  next_presentation_us);
+@@ -1456,6 +1601,7 @@ notify_crtc_frame_ready (CrtcFrame *crtc
+   MetaKmsCrtc *crtc = crtc_frame->crtc;
+ 
+   crtc_frame->pending_page_flip = FALSE;
++  crtc_frame->pending_primary_flip = FALSE;
+   crtc_frame->deadline.is_deadline_page_flip = FALSE;
+ 
+   if (!crtc_frame->pending_update)
+@@ -1542,6 +1688,7 @@ crtc_page_flip_feedback_mode_set_fallbac
+   CrtcFrame *crtc_frame = user_data;
+ 
+   crtc_frame->pending_page_flip = FALSE;
++  crtc_frame->pending_primary_flip = FALSE;
+ }
+ 
+ static void
+@@ -1552,6 +1699,7 @@ crtc_page_flip_feedback_discarded (MetaK
+   CrtcFrame *crtc_frame = user_data;
+ 
+   crtc_frame->pending_page_flip = FALSE;
++  crtc_frame->pending_primary_flip = FALSE;
+ }
+ 
+ static const MetaKmsPageFlipListenerVtable crtc_page_flip_listener_vtable = {
+@@ -1652,6 +1800,8 @@ do_process (MetaKmsImplDevice *impl_devi
+       meta_kms_feedback_get_result (feedback) == META_KMS_FEEDBACK_PASSED)
+     {
+       crtc_frame->pending_page_flip = TRUE;
++      crtc_frame->pending_primary_flip =
++        update_changes_primary_plane (update, crtc_frame->crtc);
+       meta_kms_feedback_set_ready_time_us (feedback,
+                                            crtc_frame->kms_ready_time_us);
+     }
+@@ -2052,6 +2202,9 @@ meta_kms_impl_device_update_ready (MetaT
+       if (crtc_frame->pending_page_flip ||
+           ensure_deadline_timer_armed (impl_device, crtc_frame))
+         return GINT_TO_POINTER (TRUE);
++
++      /* queue_update() 可能已把 update 合并进既有的 pending_update 并释放。 */
++      update = crtc_frame->pending_update;
+     }
+ 
+   meta_kms_impl_device_do_process_update (impl_device, crtc_frame, latch_crtc,
+@@ -2304,6 +2457,7 @@ disarm_all_frame_sources (MetaKmsImplDev
+       crtc_frame->deadline.is_deadline_page_flip = FALSE;
+       crtc_frame->await_flush = FALSE;
+       crtc_frame->pending_page_flip = FALSE;
++      crtc_frame->pending_primary_flip = FALSE;
+       disarm_crtc_frame_deadline_timer (crtc_frame);
+ 
+       discard_update (impl_device, &crtc_frame->pending_update);

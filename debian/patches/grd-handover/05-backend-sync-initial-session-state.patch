@@ -1,0 +1,39 @@
+Description: 初始化完成后同步 logind 状态，避免后台启动会话首次激活时丢失输入
+ MetaLauncher 在构造时已同步 Active，但 MetaBackend 随后才订阅通知，
+ 初始 inactive 因此丢失。首次本地激活只调用 resume，输入 seat 因为没有
+ 配对的 release 而直接返回，libinput 无法重新打开本地输入设备。
+ 初始化期间不能调用依赖未完成设备的 pause/resume；完成后读取最新状态，
+ 对 inactive 补齐一次 pause。初始 active 和无 launcher 的后端保持不变。
+Origin: downstream, GRD session-handover patch set
+Forwarded: no
+Last-Update: 2026-09-15
+
+--- a/src/backends/meta-backend.c
++++ b/src/backends/meta-backend.c
+@@ -939,8 +939,13 @@ on_session_active_changed (MetaLauncher *launcher,
+                            GParamSpec   *pspec,
+                            MetaBackend  *backend)
+ {
++  MetaBackendPrivate *priv = meta_backend_get_instance_private (backend);
+   gboolean active = meta_launcher_is_session_active (launcher);
+
++  /* 设备尚未初始化完成时只保留 launcher 的最新状态，不能提前暂停或恢复。 */
++  if (priv->in_init)
++    return;
++
+   if (active)
+     meta_backend_resume (backend);
+   else
+@@ -1415,6 +1420,13 @@ meta_backend_initable_init (GInitable     *initable,
+
+   priv->in_init = FALSE;
+
++#ifdef HAVE_LOGIND
++  /* launcher 的初始通知早于 backend 的订阅。补齐未激活会话的 pause，
++   * 让第一次切回本地时 renderer 和输入设备都能成对恢复。 */
++  if (priv->launcher && !meta_launcher_is_session_active (priv->launcher))
++    meta_backend_pause (backend);
++#endif
++
+   return TRUE;
+ }

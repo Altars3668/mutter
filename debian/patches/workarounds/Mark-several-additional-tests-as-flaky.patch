@@ -1,0 +1,212 @@
+From: Simon McVittie <smcv@debian.org>
+Date: Wed, 13 Dec 2023 10:34:02 +0000
+Subject: Mark several additional tests as flaky
+
+Most of these have never been reliable on Debian buildds, especially
+on ARM, so having them fail is not a regression. They usually succeed
+after a few retries, but that's time-consuming and unsuitable to be a
+QA gate.
+
+The input-capture test frequently hangs until it times out, so put that
+one in a separate suite so that we don't need to run it at all.
+
+Signed-off-by: Simon McVittie <smcv@debian.org>
+Forwarded: no
+---
+ src/tests/clutter/conform/gesture.c   | 24 ++++++++++++++++++++++++
+ src/tests/clutter/conform/grab.c      |  6 ++++++
+ src/tests/clutter/conform/meson.build |  8 +++++++-
+ src/tests/meson.build                 | 16 ++++++++++++++--
+ src/tests/monitor-tests-common.c      |  6 +++++-
+ src/tests/mtk/meson.build             |  1 +
+ src/tests/mtk/time-utils-tests.c      |  6 ++++++
+ 7 files changed, 63 insertions(+), 4 deletions(-)
+
+diff --git a/src/tests/clutter/conform/gesture.c b/src/tests/clutter/conform/gesture.c
+index 26ef128..dfa733d 100644
+--- a/src/tests/clutter/conform/gesture.c
++++ b/src/tests/clutter/conform/gesture.c
+@@ -133,6 +133,12 @@ gesture_state_machine_move_to_waiting (void)
+   ClutterGesture *gesture = CLUTTER_GESTURE (g_object_new (TEST_TYPE_GESTURE, NULL));
+   gboolean was_updated;
+ 
++  if (g_getenv ("DEB_ALLOW_FLAKY_TESTS") == NULL)
++    {
++      g_test_skip ("https://gitlab.gnome.org/GNOME/mutter/-/issues/3521");
++      return;
++    }
++
+   virtual_pointer = clutter_seat_create_virtual_device (seat, CLUTTER_POINTER_DEVICE);
+   now_us = g_get_monotonic_time ();
+ 
+@@ -193,6 +199,12 @@ gesture_state_machine_move_to_cancelled_while_possible (void)
+   gboolean was_updated;
+   ClutterGestureState gesture_state_change;
+ 
++  if (g_getenv ("DEB_ALLOW_FLAKY_TESTS") == NULL)
++    {
++      g_test_skip ("https://gitlab.gnome.org/GNOME/mutter/-/issues/3521");
++      return;
++    }
++
+   virtual_pointer = clutter_seat_create_virtual_device (seat, CLUTTER_POINTER_DEVICE);
+   now_us = g_get_monotonic_time ();
+ 
+@@ -241,6 +253,12 @@ gesture_state_machine_move_to_cancelled_on_sequence_cancel (void)
+   ClutterGestureState gesture_state_change;
+   g_autoptr (ClutterGrab) grab = NULL;
+ 
++  if (g_getenv ("DEB_ALLOW_FLAKY_TESTS") == NULL)
++    {
++      g_test_skip ("https://gitlab.gnome.org/GNOME/mutter/-/issues/3521");
++      return;
++    }
++
+   virtual_pointer = clutter_seat_create_virtual_device (seat, CLUTTER_POINTER_DEVICE);
+   now_us = g_get_monotonic_time ();
+ 
+@@ -298,6 +316,12 @@ gesture_multiple_mouse_buttons (void)
+   ClutterGesture *gesture = CLUTTER_GESTURE (g_object_new (TEST_TYPE_GESTURE, NULL));
+   gboolean was_updated;
+ 
++  if (g_getenv ("DEB_ALLOW_FLAKY_TESTS") == NULL)
++    {
++      g_test_skip ("https://gitlab.gnome.org/GNOME/mutter/-/issues/3521");
++      return;
++    }
++
+   virtual_pointer = clutter_seat_create_virtual_device (seat, CLUTTER_POINTER_DEVICE);
+   now_us = g_get_monotonic_time ();
+ 
+diff --git a/src/tests/clutter/conform/grab.c b/src/tests/clutter/conform/grab.c
+index 93a8cf4..9018a53 100644
+--- a/src/tests/clutter/conform/grab.c
++++ b/src/tests/clutter/conform/grab.c
+@@ -620,6 +620,12 @@ grab_input_only (void)
+   ClutterSeat *seat;
+   g_autoptr (ClutterVirtualInputDevice) pointer = NULL;
+ 
++  if (g_getenv ("DEB_ALLOW_FLAKY_TESTS") == NULL)
++    {
++      g_test_skip ("https://gitlab.gnome.org/GNOME/mutter/-/issues/3205");
++      return;
++    }
++
+   seat = clutter_test_get_default_seat ();
+   pointer = clutter_seat_create_virtual_device (seat, CLUTTER_POINTER_DEVICE);
+ 
+diff --git a/src/tests/clutter/conform/meson.build b/src/tests/clutter/conform/meson.build
+index 7cb80a2..8e95bc6 100644
+--- a/src/tests/clutter/conform/meson.build
++++ b/src/tests/clutter/conform/meson.build
+@@ -70,6 +70,12 @@ test_env.set('GSETTINGS_SCHEMA_DIR', locally_compiled_schemas_dir)
+ test_env.set('TEST_DATADIR', mutter_srcdir / 'src' / 'tests')
+ 
+ foreach test : clutter_conform_tests
++  extra_suites = []
++
++  if test == 'timeline' or test == 'timeline-interpolate'
++    extra_suites += 'flaky'
++  endif
++
+   test_executable = executable('@0@'.format(test),
+     sources: [
+       '@0@.c'.format(test),
+@@ -85,7 +91,7 @@ foreach test : clutter_conform_tests
+   )
+ 
+   test(test, test_executable,
+-    suite: ['clutter', 'clutter/conform'],
++    suite: ['clutter', 'clutter/conform'] + extra_suites,
+     env: test_env,
+     is_parallel: false,
+   )
+diff --git a/src/tests/meson.build b/src/tests/meson.build
+index 474d21a..e27fb30 100644
+--- a/src/tests/meson.build
++++ b/src/tests/meson.build
+@@ -658,6 +658,7 @@ test_cases += [
+     'name': 'input-capture',
+     'suite': 'backends/native',
+     'sources': [ 'input-capture-tests.c' ],
++    'broken': true,
+   },
+   {
+     'name': 'thread',
+@@ -1122,9 +1123,20 @@ foreach test_case: test_cases
+ 
+   args = test_case.get('args', [])
+ 
++
++  extra_suites = []
++
++  if test_case.get('flaky', false)
++    extra_suites += 'flaky'
++  endif
++
++  if test_case.get('broken', false)
++    extra_suites += 'broken'
++  endif
++
+   message('test @0@ args: @1@'.format(test_case['name'], args))
+   test(test_case['name'], test_executable,
+-    suite: ['core', 'mutter/' + test_case['suite']],
++    suite: ['core', 'mutter/' + test_case['suite']] + extra_suites,
+     args: args,
+     env: test_env,
+     depends: test_depends,
+@@ -1217,7 +1229,7 @@ stacking_tests = [
+ 
+ foreach stacking_test: stacking_tests
+   test(stacking_test, test_runner,
+-    suite: ['core', 'mutter/stacking'],
++    suite: ['core', 'mutter/stacking', 'flaky'],
+     env: test_env,
+     args: [
+       files('stacking' / stacking_test + '.metatest'),
+diff --git a/src/tests/monitor-tests-common.c b/src/tests/monitor-tests-common.c
+index 44dcb10..2780d94 100644
+--- a/src/tests/monitor-tests-common.c
++++ b/src/tests/monitor-tests-common.c
+@@ -276,7 +276,11 @@ meta_check_monitor_test_clients_state (void)
+ 
+   meta_check_test_client_state (wayland_monitor_test_client);
+   meta_check_test_client_state (x11_monitor_test_client);
+-  check_test_client_x11_state (x11_monitor_test_client);
++
++  if (g_getenv ("DEB_ALLOW_FLAKY_TESTS") == NULL)
++    g_test_skip ("https://gitlab.gnome.org/GNOME/mutter/-/issues/4200");
++  else
++    check_test_client_x11_state (x11_monitor_test_client);
+ }
+ 
+ static MetaMonitorTestSetup *
+diff --git a/src/tests/mtk/meson.build b/src/tests/mtk/meson.build
+index 4e21b2f..d372d2d 100644
+--- a/src/tests/mtk/meson.build
++++ b/src/tests/mtk/meson.build
+@@ -30,6 +30,7 @@ test_cases += [
+   {
+     'name': 'mtk-time-utils',
+     'suite': 'unit',
++    'flaky': true,
+     'sources': [
+       'mtk/time-utils-tests.c',
+     ]
+diff --git a/src/tests/mtk/time-utils-tests.c b/src/tests/mtk/time-utils-tests.c
+index 3f54f6b..1b054f8 100644
+--- a/src/tests/mtk/time-utils-tests.c
++++ b/src/tests/mtk/time-utils-tests.c
+@@ -28,6 +28,12 @@ test_extrapolate_interval_boundary (void)
+   int64_t now_us;
+   int64_t next_interval_boundary_us;
+ 
++  if (g_getenv ("DEB_ALLOW_FLAKY_TESTS") == NULL)
++    {
++      g_test_skip ("https://gitlab.gnome.org/GNOME/mutter/-/issues/4199");
++      return;
++    }
++
+   now_us = g_get_monotonic_time ();
+ 
+   next_interval_boundary_us =

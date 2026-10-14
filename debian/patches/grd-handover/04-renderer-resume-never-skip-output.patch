@@ -1,0 +1,71 @@
+Description: renderer: never skip the output restore when resume finds no pause
+ .
+ meta_renderer_resume() guarded itself with g_return_if_fail (priv->is_paused).
+ That is an early return, so a pause/resume imbalance did not merely log a
+ warning -- it skipped klass->resume(), which on the native backend is what
+ invalidates the onscreen framebuffers and brings KMS output back. The visible
+ result is a session that logs in, holds the console, answers D-Bus, and renders
+ nothing: a black screen indistinguishable from a hang, recoverable only by
+ switching VT away and back to force a clean pause/resume cycle.
+ .
+ Seen on a machine running the GRD session-handover stack: after a day of remote
+ sessions the console user logged in at the greeter, mutter resumed the existing
+ session, the assertion tripped, and the screen stayed dark.
+ .
+ The two halves of resume are not equally risky. meta_renderer_native_resume()
+ only calls meta_onscreen_native_invalidate() per view -- idempotent and cheap to
+ repeat. clutter_frame_clock_uninhibit() is reference counted, so that is the one
+ part worth skipping. Skip only that, and always restore the output.
+ .
+ This does not explain how the imbalance arises. It stops the imbalance from
+ costing the user their display.
+Author: Geoffrey <altarscn2@gmail.com>
+Origin: downstream, GRD session-handover patch set
+Forwarded: not-needed
+Last-Update: 2026-08-29
+
+Index: mutter-50.1/src/backends/meta-renderer.c
+===================================================================
+--- mutter-50.1.orig/src/backends/meta-renderer.c
++++ mutter-50.1/src/backends/meta-renderer.c
+@@ -346,19 +346,30 @@ meta_renderer_resume (MetaRenderer *rend
+   MetaRendererClass *klass = META_RENDERER_GET_CLASS (renderer);
+   GList *l;
+ 
+-  g_return_if_fail (priv->is_paused);
+-  priv->is_paused = FALSE;
+-
+-  for (l = priv->views; l; l = l->next)
++  if (priv->is_paused)
+     {
+-      ClutterStageView *stage_view = l->data;
+-      ClutterFrameClock *frame_clock;
++      priv->is_paused = FALSE;
++
++      for (l = priv->views; l; l = l->next)
++        {
++          ClutterStageView *stage_view = l->data;
++          ClutterFrameClock *frame_clock;
+ 
+-      if (meta_renderer_view_renders_offscreen (stage_view))
+-        continue;
++          if (meta_renderer_view_renders_offscreen (stage_view))
++            continue;
+ 
+-      frame_clock = clutter_stage_view_get_frame_clock (stage_view);
+-      clutter_frame_clock_uninhibit (frame_clock);
++          frame_clock = clutter_stage_view_get_frame_clock (stage_view);
++          clutter_frame_clock_uninhibit (frame_clock);
++        }
++    }
++  else
++    {
++      /* No matching pause. The frame clocks were never inhibited and
++       * uninhibiting them would underflow their counters, so skip that -- but
++       * the output still has to come back. Returning here is what left a
++       * logged-in session holding the console with nothing on screen. */
++      g_warning ("Renderer resumed without a matching pause; "
++                 "restoring output anyway");
+     }
+ 
+   if (klass->resume)

@@ -1,0 +1,123 @@
+Description: screen-cast/virtual-stream: passive frame clock + coalesce schedule_update()
+ .
+ Makes the virtual screen-cast stream frame clock passive and coalesces redraw scheduling to the refresh interval, so GRD-handover virtual monitors keep delivering frames while the physical session is paused, without busy-looping.
+Author: Geoffrey <altarscn2@gmail.com>
+Origin: downstream, GRD session-handover patch set
+Forwarded: not-needed
+Last-Update: 2026-06-04
+
+Index: mutter-50.1/src/backends/meta-screen-cast-virtual-stream-src.c
+===================================================================
+--- mutter-50.1.orig/src/backends/meta-screen-cast-virtual-stream-src.c
++++ mutter-50.1/src/backends/meta-screen-cast-virtual-stream-src.c
+@@ -99,6 +99,19 @@ struct _MetaScreenCastFrameClockDriver
+   ClutterFrameClockDriver parent;
+ 
+   MetaScreenCastStreamSrc *src;
++
++  /*
++   * The screen-cast frame clock is PASSIVE: it has no vsync of its own and is
++   * driven by schedule_update() calls, e.g. one per pointer-motion event. To
++   * avoid producing one captured + encoded frame per input event (which floods
++   * the RDP AVC444 partial-frame encoder and makes the remote interface
++   * shimmer/dart during cursor motion), coalesce schedule_update() to at most
++   * one frame per refresh interval, with a guaranteed trailing frame so the
++   * final state is always delivered.
++   */
++  ClutterFrameClock *frame_clock;  /* not owned */
++  int64_t last_dispatch_us;
++  guint catch_up_source_id;
+ };
+ 
+ G_DEFINE_TYPE (MetaScreenCastFrameClockDriver, meta_screen_cast_frame_clock_driver,
+@@ -257,6 +270,7 @@ make_frame_clock_passive (MetaScreenCast
+ 
+   driver = g_object_new (META_TYPE_SCREEN_CAST_FRAME_CLOCK_DRIVER, NULL);
+   driver->src = src;
++  driver->frame_clock = frame_clock;
+ 
+   update_frame_clock_driver (virtual_src, driver);
+ 
+@@ -1020,22 +1034,80 @@ meta_screen_cast_virtual_stream_src_clas
+                                      obj_props);
+ }
+ 
++static gboolean
++meta_screen_cast_frame_clock_driver_catch_up (gpointer user_data)
++{
++  MetaScreenCastFrameClockDriver *driver = user_data;
++
++  driver->catch_up_source_id = 0;
++
++  if (driver->src)
++    {
++      driver->last_dispatch_us = g_get_monotonic_time ();
++      meta_screen_cast_stream_src_request_process (driver->src);
++    }
++
++  return G_SOURCE_REMOVE;
++}
++
+ static void
+ meta_screen_cast_frame_clock_driver_schedule_update (ClutterFrameClockDriver *frame_clock_driver)
+ {
+   MetaScreenCastFrameClockDriver *driver =
+     META_SCREEN_CAST_FRAME_CLOCK_DRIVER (frame_clock_driver);
++  int64_t now_us;
++  int64_t interval_us;
++  int64_t since_us;
+ 
+-  if (driver->src)
+-    meta_screen_cast_stream_src_request_process (driver->src);
++  if (!driver->src || !driver->frame_clock)
++    return;
++
++  /*
++   * Coalesce per-event schedule_update() calls (e.g. one per pointer-motion
++   * event) to the refresh cadence: emit a frame immediately if at least one
++   * refresh interval has elapsed, otherwise queue a single trailing frame at
++   * the next interval boundary so the final position is always delivered (no
++   * lag, no freeze) without flooding the encoder with one frame per input
++   * event.
++   */
++  now_us = g_get_monotonic_time ();
++  interval_us = clutter_frame_clock_get_refresh_interval (driver->frame_clock);
++  since_us = now_us - driver->last_dispatch_us;
++
++  if (interval_us <= 0 || since_us >= interval_us)
++    {
++      driver->last_dispatch_us = now_us;
++      meta_screen_cast_stream_src_request_process (driver->src);
++    }
++  else if (driver->catch_up_source_id == 0)
++    {
++      driver->catch_up_source_id =
++        g_timeout_add (((interval_us - since_us) / 1000) + 1,
++                       meta_screen_cast_frame_clock_driver_catch_up,
++                       driver);
++    }
++}
++
++static void
++meta_screen_cast_frame_clock_driver_finalize (GObject *object)
++{
++  MetaScreenCastFrameClockDriver *driver =
++    META_SCREEN_CAST_FRAME_CLOCK_DRIVER (object);
++
++  g_clear_handle_id (&driver->catch_up_source_id, g_source_remove);
++
++  G_OBJECT_CLASS (meta_screen_cast_frame_clock_driver_parent_class)->finalize (object);
+ }
+ 
+ static void
+ meta_screen_cast_frame_clock_driver_class_init (MetaScreenCastFrameClockDriverClass *klass)
+ {
++  GObjectClass *object_class = G_OBJECT_CLASS (klass);
+   ClutterFrameClockDriverClass *driver_class =
+     CLUTTER_FRAME_CLOCK_DRIVER_CLASS (klass);
+ 
++  object_class->finalize = meta_screen_cast_frame_clock_driver_finalize;
++
+   driver_class->schedule_update =
+     meta_screen_cast_frame_clock_driver_schedule_update;
+ }

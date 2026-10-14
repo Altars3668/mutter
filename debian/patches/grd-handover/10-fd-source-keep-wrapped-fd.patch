@@ -1,0 +1,49 @@
+Description: 通用 fd 事件源不再在 finalize 时关闭所包装的 fd
+ meta_create_fd_source() 的调用方传入的都是库内部的 epoll fd：seat-impl
+ 传 libinput_get_fd()，输入捕获会话传 eis_get_fd()。这些 fd 由
+ libinput_unref() / eis_unref() 关闭，finalize 再关一次就是重复关闭，
+ 两次之间被别的线程复用的编号会被误关。与 09 同一缺陷：输入捕获会话
+ 结束时必然发生，seat-impl 在销毁（关机）时发生。
+Origin: downstream, GRD session-handover patch set
+Forwarded: no
+Last-Update: 2026-10-10
+
+--- a/src/backends/meta-fd-source.c
++++ b/src/backends/meta-fd-source.c
+@@ -20,8 +20,6 @@
+ 
+ #include "config.h"
+ 
+-#include <unistd.h>
+-
+ #include "backends/meta-fd-source.h"
+ 
+ typedef struct _MetaFdtSource
+@@ -64,19 +62,10 @@
+   return fd_source->dispatch (fd_source->user_data);
+ }
+ 
+-static void
+-meta_fd_source_finalize (GSource *source)
+-{
+-  MetaFdSource *fd_source = (MetaFdSource *) source;
+-
+-  close (fd_source->poll_fd.fd);
+-}
+-
+ static GSourceFuncs fd_source_funcs = {
+   .prepare = meta_fd_source_prepare,
+   .check = meta_fd_source_check,
+   .dispatch = meta_fd_source_dispatch,
+-  .finalize = meta_fd_source_finalize,
+ };
+ 
+ GSource *
+@@ -94,6 +83,7 @@
+   g_source_set_name (source, name);
+   fd_source = (MetaFdSource *) source;
+ 
++  /* 不接管 fd：调用方传入的是 libinput/libeis 内部的 epoll fd，由库自己关闭。 */
+   fd_source->poll_fd.fd = fd;
+   fd_source->poll_fd.events = G_IO_IN;
+ 

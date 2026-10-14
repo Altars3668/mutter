@@ -1,0 +1,1316 @@
+Description: 拼接显示器用一个整屏视图渲染，一次原子提交驱动全部 tile CRTC
+ 双 DP 等拼接显示器（DisplayID tiled）原先每个 tile CRTC 各有一个视图、帧时钟
+ 和提交。主视图绘制后即向客户端发帧回调，客户端常在另一视图绘制前提交新帧，
+ 两侧便取到不同代的画面；两次提交也可能落在不同 vblank。实测滚动时约七成帧
+ 中缝两侧内容不一致。
+ .
+ 满足条件时（原子 KMS、同一 GPU、无旋转、未启用 VRR、各 tile 刷新率一致）改为
+ 一个与整屏同尺寸的视图：一次绘制，同一缓冲按 tile 区域分别赋给各 CRTC 的主
+ 平面，放进同一次原子提交。KMS 层把各 tile CRTC 锁存到 leader：共用 deadline
+ 和帧状态，tile 上的光标随 leader 提交，按实际涉及的 CRTC 逐个监听翻帧并等全部
+ 完成。模式设置、gamma、隐私屏和硬件光标覆盖全部 tile；整屏视图不做直接扫描。
+ 设置 MUTTER_DEBUG_DISABLE_TILED_VIEWS=1 可退回每个 CRTC 一个视图。
+Origin: downstream
+Forwarded: no
+Last-Update: 2026-10-04
+--- a/src/backends/meta-renderer.c
++++ b/src/backends/meta-renderer.c
+@@ -142,6 +142,10 @@ create_crtc_view (MetaLogicalMonitor *lo
+   MetaRendererView *view;
+   g_autoptr (GError) error = NULL;
+ 
++  /* 拼接显示器的整屏视图已经驱动了这个 tile 的 CRTC。 */
++  if (meta_renderer_get_view_for_crtc (renderer, crtc))
++    return;
++
+   view = meta_renderer_create_view (renderer,
+                                     logical_monitor,
+                                     monitor,
+@@ -205,7 +209,7 @@ meta_renderer_get_view_for_crtc (MetaRen
+     {
+       MetaRendererView *view = l->data;
+ 
+-      if (meta_renderer_view_get_crtc (view) == crtc)
++      if (meta_renderer_view_has_crtc (view, crtc))
+         return view;
+     }
+ 
+--- a/src/backends/meta-renderer-view.c
++++ b/src/backends/meta-renderer-view.c
+@@ -57,6 +57,9 @@ typedef struct _MetaRendererViewPrivate
+   MetaBackend *backend;
+   MetaCrtc *crtc;
+   MetaColorDevice *color_device;
++
++  /* 拼接显示器整屏视图驱动的全部 CRTC（含 crtc），普通视图为 NULL。 */
++  GList *tile_crtcs;
+ } MetaRendererViewPrivate;
+ 
+ G_DEFINE_TYPE_WITH_PRIVATE (MetaRendererView, meta_renderer_view,
+@@ -71,6 +74,37 @@ meta_renderer_view_get_crtc (MetaRendere
+   return priv->crtc;
+ }
+ 
++void
++meta_renderer_view_set_tile_crtcs (MetaRendererView *view,
++                                   GList            *crtcs)
++{
++  MetaRendererViewPrivate *priv =
++    meta_renderer_view_get_instance_private (view);
++
++  g_clear_list (&priv->tile_crtcs, g_object_unref);
++  priv->tile_crtcs = g_list_copy_deep (crtcs, (GCopyFunc) g_object_ref, NULL);
++}
++
++/* 返回整屏视图驱动的全部 tile CRTC；普通视图返回 NULL。 */
++GList *
++meta_renderer_view_get_tile_crtcs (MetaRendererView *view)
++{
++  MetaRendererViewPrivate *priv =
++    meta_renderer_view_get_instance_private (view);
++
++  return priv->tile_crtcs;
++}
++
++gboolean
++meta_renderer_view_has_crtc (MetaRendererView *view,
++                             MetaCrtc         *crtc)
++{
++  MetaRendererViewPrivate *priv =
++    meta_renderer_view_get_instance_private (view);
++
++  return priv->crtc == crtc || g_list_find (priv->tile_crtcs, crtc);
++}
++
+ static void
+ set_color_states (MetaRendererView *view)
+ {
+@@ -203,6 +237,7 @@ meta_renderer_view_dispose (GObject *obj
+     meta_renderer_view_get_instance_private (view);
+ 
+   g_clear_object (&priv->color_device);
++  g_clear_list (&priv->tile_crtcs, g_object_unref);
+ 
+   G_OBJECT_CLASS (meta_renderer_view_parent_class)->dispose (object);
+ }
+--- a/src/backends/meta-renderer-view.h
++++ b/src/backends/meta-renderer-view.h
+@@ -34,3 +34,11 @@ struct _MetaRendererViewClass
+ 
+ META_EXPORT_TEST
+ MetaCrtc *meta_renderer_view_get_crtc (MetaRendererView *view);
++
++void meta_renderer_view_set_tile_crtcs (MetaRendererView *view,
++                                        GList            *crtcs);
++
++GList * meta_renderer_view_get_tile_crtcs (MetaRendererView *view);
++
++gboolean meta_renderer_view_has_crtc (MetaRendererView *view,
++                                      MetaCrtc         *crtc);
+--- a/src/backends/native/meta-cursor-renderer-native.c
++++ b/src/backends/native/meta-cursor-renderer-native.c
+@@ -400,8 +400,10 @@ meta_cursor_renderer_native_update_curso
+       MetaStageView *view = l->data;
+       MetaRendererView *renderer_view = META_RENDERER_VIEW (view);
+       MetaCrtc *crtc = meta_renderer_view_get_crtc (renderer_view);
+-      MetaCrtcNative *crtc_native = META_CRTC_NATIVE (crtc);
+-      MetaGpu *gpu = meta_crtc_get_gpu (crtc);
++      GList single_crtc = { .data = crtc };
++      GList *view_crtcs;
++      GList *c;
++      gboolean hw_cursor_supported = TRUE;
+       ClutterColorState *target_color_state =
+         clutter_stage_view_get_output_color_state (CLUTTER_STAGE_VIEW (view));
+       CursorStageView *cursor_stage_view = NULL;
+@@ -410,9 +412,22 @@ meta_cursor_renderer_native_update_curso
+       cursor_stage_view = get_cursor_stage_view (view);
+       g_assert (cursor_stage_view);
+ 
+-      if (!META_IS_CRTC_KMS (crtc) ||
+-          !is_hw_cursor_available_for_gpu (META_GPU_KMS (gpu)) ||
+-          !meta_crtc_native_is_hw_cursor_supported (crtc_native))
++      /* 拼接显示器的整屏视图驱动多个 tile CRTC，每个 CRTC 的光标平面都要设置。 */
++      view_crtcs = meta_renderer_view_get_tile_crtcs (renderer_view);
++      if (!view_crtcs)
++        view_crtcs = &single_crtc;
++
++      for (c = view_crtcs; c; c = c->next)
++        {
++          MetaCrtc *view_crtc = c->data;
++
++          if (!META_IS_CRTC_KMS (view_crtc) ||
++              !is_hw_cursor_available_for_gpu (META_GPU_KMS (meta_crtc_get_gpu (view_crtc))) ||
++              !meta_crtc_native_is_hw_cursor_supported (META_CRTC_NATIVE (view_crtc)))
++            hw_cursor_supported = FALSE;
++        }
++
++      if (!hw_cursor_supported)
+         {
+           cursor_stage_view->is_hw_cursor_valid = TRUE;
+           has_hw_cursor = FALSE;
+@@ -424,10 +439,31 @@ meta_cursor_renderer_native_update_curso
+           if (cursor_changed ||
+               !cursor_stage_view->is_hw_cursor_valid)
+             {
+-              has_hw_cursor = realize_cursor_sprite_for_crtc (cursor_renderer,
+-                                                              META_CRTC_KMS (crtc),
+-                                                              target_color_state,
+-                                                              cursor);
++              has_hw_cursor = TRUE;
++              for (c = view_crtcs; c && has_hw_cursor; c = c->next)
++                {
++                  has_hw_cursor =
++                    realize_cursor_sprite_for_crtc (cursor_renderer,
++                                                    META_CRTC_KMS (c->data),
++                                                    target_color_state,
++                                                    cursor);
++                }
++
++              /* 部分 tile 成功时整视图改用软件光标，已设置的硬件光标要撤下。 */
++              if (!has_hw_cursor && view_crtcs->next)
++                {
++                  for (c = view_crtcs; c; c = c->next)
++                    {
++                      MetaKmsCrtc *kms_crtc =
++                        meta_crtc_kms_get_kms_crtc (META_CRTC_KMS (c->data));
++
++                      meta_kms_cursor_manager_update_sprite (kms_cursor_manager,
++                                                             kms_crtc,
++                                                             NULL,
++                                                             MTK_MONITOR_TRANSFORM_NORMAL,
++                                                             NULL);
++                    }
++                }
+ 
+               cursor_stage_view->is_hw_cursor_valid = TRUE;
+             }
+@@ -453,14 +489,17 @@ meta_cursor_renderer_native_update_curso
+ 
+           if (!has_hw_cursor)
+             {
+-              MetaCrtcKms *crtc_kms = META_CRTC_KMS (crtc);
+-              MetaKmsCrtc *kms_crtc = meta_crtc_kms_get_kms_crtc (crtc_kms);
+-
+-              meta_kms_cursor_manager_update_sprite (kms_cursor_manager,
+-                                                     kms_crtc,
+-                                                     NULL,
+-                                                     MTK_MONITOR_TRANSFORM_NORMAL,
+-                                                     NULL);
++              for (c = view_crtcs; c; c = c->next)
++                {
++                  MetaCrtcKms *crtc_kms = META_CRTC_KMS (c->data);
++                  MetaKmsCrtc *kms_crtc = meta_crtc_kms_get_kms_crtc (crtc_kms);
++
++                  meta_kms_cursor_manager_update_sprite (kms_cursor_manager,
++                                                         kms_crtc,
++                                                         NULL,
++                                                         MTK_MONITOR_TRANSFORM_NORMAL,
++                                                         NULL);
++                }
+             }
+         }
+ 
+--- a/src/backends/native/meta-kms-cursor-manager.c
++++ b/src/backends/native/meta-kms-cursor-manager.c
+@@ -500,17 +500,34 @@ update_filter_cb (MetaKmsImpl       *imp
+     }
+   else
+     {
+-      MetaDrmBuffer *old_buffer = NULL;
++      GPtrArray *crtc_states = cursor_manager_impl->crtc_states;
++      MetaKmsDevice *device = meta_kms_crtc_get_device (crtc);
++      int i;
+ 
+-      update = maybe_update_cursor_plane (cursor_manager_impl,
+-                                          crtc, update, &old_buffer);
++      if (!crtc_states)
++        return update;
+ 
+-      if (old_buffer)
++      /* 拼接整屏视图的 tile CRTC 锁存到 crtc，它们的光标也随这次提交更新。 */
++      for (i = 0; i < crtc_states->len; i++)
+         {
+-          meta_thread_queue_callback (meta_thread_impl_get_thread (thread_impl),
+-                                      g_main_context_default (),
+-                                      NULL,
+-                                      old_buffer, g_object_unref);
++          CrtcStateImpl *crtc_state_impl = g_ptr_array_index (crtc_states, i);
++          MetaKmsCrtc *state_crtc = crtc_state_impl->crtc;
++          MetaDrmBuffer *old_buffer = NULL;
++
++          if (meta_kms_crtc_get_device (state_crtc) != device ||
++              meta_kms_device_get_crtc_latch_leader (device, state_crtc) != crtc)
++            continue;
++
++          update = maybe_update_cursor_plane (cursor_manager_impl,
++                                              state_crtc, update, &old_buffer);
++
++          if (old_buffer)
++            {
++              meta_thread_queue_callback (meta_thread_impl_get_thread (thread_impl),
++                                          g_main_context_default (),
++                                          NULL,
++                                          old_buffer, g_object_unref);
++            }
+         }
+     }
+ 
+--- a/src/backends/native/meta-kms-device.c
++++ b/src/backends/native/meta-kms-device.c
+@@ -71,6 +71,9 @@ struct _MetaKmsDevice
+ 
+   GHashTable *needs_flush_crtcs;
+   GMutex needs_flush_mutex;
++
++  GHashTable *latch_leaders;
++  GMutex latch_leaders_mutex;
+ };
+ 
+ G_DEFINE_TYPE (MetaKmsDevice, meta_kms_device, G_TYPE_OBJECT);
+@@ -410,6 +413,52 @@ meta_kms_device_set_needs_flush (MetaKms
+     }
+ }
+ 
++/* 只有原子 KMS 能在一次提交中让多个 CRTC 同时翻帧。 */
++gboolean
++meta_kms_device_uses_atomic_modesetting (MetaKmsDevice *device)
++{
++  return META_IS_KMS_IMPL_DEVICE_ATOMIC (device->impl_device);
++}
++
++/*
++ * 拼接显示器由一个整屏视图驱动多个 tile CRTC。这些 CRTC 的更新锁存到同一个
++ * leader：一次原子提交、同一次 vblank 翻帧，共用 leader 的 deadline 与帧状态。
++ * 主线程在建视图时登记，主线程与 KMS 线程都会查询。
++ */
++void
++meta_kms_device_set_crtc_latch_leader (MetaKmsDevice *device,
++                                       MetaKmsCrtc   *crtc,
++                                       MetaKmsCrtc   *leader)
++{
++  g_mutex_lock (&device->latch_leaders_mutex);
++  if (leader && leader != crtc)
++    g_hash_table_insert (device->latch_leaders, crtc, leader);
++  else
++    g_hash_table_remove (device->latch_leaders, crtc);
++  g_mutex_unlock (&device->latch_leaders_mutex);
++}
++
++void
++meta_kms_device_clear_crtc_latch_leaders (MetaKmsDevice *device)
++{
++  g_mutex_lock (&device->latch_leaders_mutex);
++  g_hash_table_remove_all (device->latch_leaders);
++  g_mutex_unlock (&device->latch_leaders_mutex);
++}
++
++MetaKmsCrtc *
++meta_kms_device_get_crtc_latch_leader (MetaKmsDevice *device,
++                                       MetaKmsCrtc   *crtc)
++{
++  MetaKmsCrtc *leader;
++
++  g_mutex_lock (&device->latch_leaders_mutex);
++  leader = g_hash_table_lookup (device->latch_leaders, crtc);
++  g_mutex_unlock (&device->latch_leaders_mutex);
++
++  return leader ? leader : crtc;
++}
++
+ gboolean
+ meta_kms_device_handle_flush (MetaKmsDevice *device,
+                               MetaKmsCrtc   *crtc)
+@@ -825,6 +874,8 @@ meta_kms_device_finalize (GObject *objec
+ 
+   g_mutex_clear (&device->needs_flush_mutex);
+   g_hash_table_unref (device->needs_flush_crtcs);
++  g_mutex_clear (&device->latch_leaders_mutex);
++  g_hash_table_unref (device->latch_leaders);
+ 
+   G_OBJECT_CLASS (meta_kms_device_parent_class)->finalize (object);
+ }
+@@ -834,6 +885,8 @@ meta_kms_device_init (MetaKmsDevice *dev
+ {
+   device->needs_flush_crtcs = g_hash_table_new (NULL, NULL);
+   g_mutex_init (&device->needs_flush_mutex);
++  device->latch_leaders = g_hash_table_new (NULL, NULL);
++  g_mutex_init (&device->latch_leaders_mutex);
+ }
+ 
+ static void
+--- a/src/backends/native/meta-kms-device-private.h
++++ b/src/backends/native/meta-kms-device-private.h
+@@ -35,3 +35,14 @@ MetaKmsConnector * meta_kms_device_find_
+ 
+ void meta_kms_device_set_needs_flush (MetaKmsDevice *device,
+                                       MetaKmsCrtc   *crtc);
++
++gboolean meta_kms_device_uses_atomic_modesetting (MetaKmsDevice *device);
++
++void meta_kms_device_set_crtc_latch_leader (MetaKmsDevice *device,
++                                            MetaKmsCrtc   *crtc,
++                                            MetaKmsCrtc   *leader);
++
++void meta_kms_device_clear_crtc_latch_leaders (MetaKmsDevice *device);
++
++MetaKmsCrtc * meta_kms_device_get_crtc_latch_leader (MetaKmsDevice *device,
++                                                     MetaKmsCrtc   *crtc);
+--- a/src/backends/native/meta-kms-impl-device.c
++++ b/src/backends/native/meta-kms-impl-device.c
+@@ -69,6 +69,8 @@ typedef struct _CrtcDeadline
+   gboolean await_flush;
+   gboolean pending_page_flip;
+   gboolean pending_primary_flip;
++  /* 本次提交里尚未翻帧的 CRTC 数；拼接整屏视图一次提交会翻多个 tile CRTC。 */
++  int pending_page_flips;
+   int64_t kms_ready_time_us;
+ 
+   struct {
+@@ -137,6 +139,9 @@ initable_iface_init (GInitableIface *ifa
+ static CrtcFrame * get_crtc_frame (MetaKmsImplDevice *impl_device,
+                                    MetaKmsCrtc       *latch_crtc);
+ 
++static void discard_update (MetaKmsImplDevice  *impl_device,
++                            MetaKmsUpdate     **update);
++
+ G_DEFINE_TYPE_WITH_CODE (MetaKmsImplDevice, meta_kms_impl_device,
+                          G_TYPE_OBJECT,
+                          G_ADD_PRIVATE (MetaKmsImplDevice)
+@@ -1595,6 +1600,21 @@ rearm_deadline_timer (MetaKmsImplDevice
+   return ensure_deadline_timer_armed (impl_device, crtc_frame);
+ }
+ 
++/* 每个 CRTC 的翻帧回调各调用一次；等本次提交涉及的 CRTC 全部翻帧后才返回 TRUE，
++ * 否则下一次提交可能落在某个 tile 尚未完成的翻帧上而被内核拒绝。 */
++static gboolean
++crtc_frame_complete_page_flip (CrtcFrame *crtc_frame)
++{
++  if (crtc_frame->pending_page_flips > 1)
++    {
++      crtc_frame->pending_page_flips--;
++      return FALSE;
++    }
++
++  crtc_frame->pending_page_flips = 0;
++  return TRUE;
++}
++
+ static void
+ notify_crtc_frame_ready (CrtcFrame *crtc_frame)
+ {
+@@ -1631,6 +1651,9 @@ crtc_page_flip_feedback_flipped (MetaKms
+   presentation_time_us = meta_timeval_to_microseconds (&page_flip_timeval);
+   meta_kms_crtc_set_presentation_time (crtc, presentation_time_us);
+ 
++  if (!crtc_frame_complete_page_flip (crtc_frame))
++    return;
++
+   if (crtc_frame->kms_ready_time_us &&
+       !crtc_frame->pending_update &&
+       meta_kms_crtc_get_current_state (crtc)->vrr.enabled)
+@@ -1678,6 +1701,9 @@ crtc_page_flip_feedback_ready (MetaKmsCr
+ {
+   CrtcFrame *crtc_frame = user_data;
+ 
++  if (!crtc_frame_complete_page_flip (crtc_frame))
++    return;
++
+   notify_crtc_frame_ready (crtc_frame);
+ }
+ 
+@@ -1687,6 +1713,9 @@ crtc_page_flip_feedback_mode_set_fallbac
+ {
+   CrtcFrame *crtc_frame = user_data;
+ 
++  if (!crtc_frame_complete_page_flip (crtc_frame))
++    return;
++
+   crtc_frame->pending_page_flip = FALSE;
+   crtc_frame->pending_primary_flip = FALSE;
+ }
+@@ -1698,6 +1727,9 @@ crtc_page_flip_feedback_discarded (MetaK
+ {
+   CrtcFrame *crtc_frame = user_data;
+ 
++  if (!crtc_frame_complete_page_flip (crtc_frame))
++    return;
++
+   crtc_frame->pending_page_flip = FALSE;
+   crtc_frame->pending_primary_flip = FALSE;
+ }
+@@ -1739,6 +1771,59 @@ queue_result_feedback (MetaKmsImplDevice
+     }
+ }
+ 
++static void
++add_unique_crtc (GPtrArray   *crtcs,
++                 MetaKmsCrtc *crtc,
++                 MetaKmsCrtc *leader)
++{
++  if (meta_kms_device_get_crtc_latch_leader (meta_kms_crtc_get_device (crtc),
++                                             crtc) != leader)
++    return;
++
++  if (!g_ptr_array_find (crtcs, crtc, NULL))
++    g_ptr_array_add (crtcs, crtc);
++}
++
++/*
++ * 原子提交为其中涉及的每个 CRTC 各发一次翻帧事件。拼接整屏视图的更新锁存到
++ * leader，却可能只涉及某个 tile（例如只有那个 tile 上的光标变了），因此要按
++ * 实际涉及的 CRTC 逐个监听；只等 leader 的事件会让帧状态永远挂起。
++ * 返回登记的监听数。
++ */
++static int
++add_crtc_page_flip_listeners (CrtcFrame     *crtc_frame,
++                              MetaKmsUpdate *update,
++                              GMainContext  *thread_context)
++{
++  g_autoptr (GPtrArray) crtcs = g_ptr_array_new ();
++  MetaKmsCrtc *leader = crtc_frame->crtc;
++  GList *l;
++  unsigned int i;
++
++  for (l = meta_kms_update_get_plane_assignments (update); l; l = l->next)
++    add_unique_crtc (crtcs, ((MetaKmsPlaneAssignment *) l->data)->crtc, leader);
++  for (l = meta_kms_update_get_mode_sets (update); l; l = l->next)
++    add_unique_crtc (crtcs, ((MetaKmsModeSet *) l->data)->crtc, leader);
++  for (l = meta_kms_update_get_crtc_updates (update); l; l = l->next)
++    add_unique_crtc (crtcs, ((MetaKmsCrtcUpdate *) l->data)->crtc, leader);
++  for (l = meta_kms_update_get_crtc_color_updates (update); l; l = l->next)
++    add_unique_crtc (crtcs, ((MetaKmsCrtcColorUpdate *) l->data)->crtc, leader);
++
++  if (crtcs->len == 0)
++    g_ptr_array_add (crtcs, leader);
++
++  for (i = 0; i < crtcs->len; i++)
++    {
++      meta_kms_update_add_page_flip_listener (update,
++                                              g_ptr_array_index (crtcs, i),
++                                              &crtc_page_flip_listener_vtable,
++                                              thread_context,
++                                              crtc_frame, NULL);
++    }
++
++  return crtcs->len;
++}
++
+ static MetaKmsFeedback *
+ do_process (MetaKmsImplDevice *impl_device,
+             MetaKmsCrtc       *latch_crtc,
+@@ -1752,6 +1837,7 @@ do_process (MetaKmsImplDevice *impl_devi
+   MetaThreadImpl *thread_impl = META_THREAD_IMPL (impl);
+   MetaKmsImplDeviceClass *klass = META_KMS_IMPL_DEVICE_GET_CLASS (impl_device);
+   CrtcFrame *crtc_frame = NULL;
++  int n_page_flips = 0;
+   MetaKmsFeedback *feedback;
+   MetaKmsResourceChanges changes = META_KMS_RESOURCE_CHANGE_NONE;
+ 
+@@ -1786,11 +1872,8 @@ do_process (MetaKmsImplDevice *impl_devi
+           GMainContext *thread_context =
+             meta_thread_impl_get_main_context (thread_impl);
+ 
+-          meta_kms_update_add_page_flip_listener (update,
+-                                                  crtc_frame->crtc,
+-                                                  &crtc_page_flip_listener_vtable,
+-                                                  thread_context,
+-                                                  crtc_frame, NULL);
++          n_page_flips = add_crtc_page_flip_listeners (crtc_frame, update,
++                                                       thread_context);
+         }
+     }
+ 
+@@ -1800,6 +1883,7 @@ do_process (MetaKmsImplDevice *impl_devi
+       meta_kms_feedback_get_result (feedback) == META_KMS_FEEDBACK_PASSED)
+     {
+       crtc_frame->pending_page_flip = TRUE;
++      crtc_frame->pending_page_flips = n_page_flips;
+       crtc_frame->pending_primary_flip =
+         update_changes_primary_plane (update, crtc_frame->crtc);
+       meta_kms_feedback_set_ready_time_us (feedback,
+@@ -1871,6 +1955,16 @@ crtc_frame_deadline_dispatch (MetaThread
+       return GINT_TO_POINTER (FALSE);
+     }
+ 
++  /* 建组前为某个 tile 单独布防的 deadline：交给 leader 统一提交，
++   * 不能让该 tile 单独翻帧。 */
++  if (meta_kms_device_get_crtc_latch_leader (device, crtc) != crtc)
++    {
++      disarm_crtc_frame_deadline_timer (crtc_frame);
++      discard_update (impl_device, &crtc_frame->pending_update);
++      meta_kms_impl_device_schedule_process (impl_device, crtc);
++      return GINT_TO_POINTER (TRUE);
++    }
++
+   if (crtc_frame->pending_update)
+     {
+       target_presentation_time_us =
+@@ -2376,6 +2470,7 @@ meta_kms_impl_device_await_flush (MetaKm
+               meta_kms_crtc_get_id (crtc),
+               priv->path);
+ 
++  crtc = meta_kms_device_get_crtc_latch_leader (priv->device, crtc);
+   crtc_frame = ensure_crtc_frame (impl_device, crtc);
+   crtc_frame->await_flush = TRUE;
+ 
+@@ -2387,8 +2482,12 @@ void
+ meta_kms_impl_device_schedule_process (MetaKmsImplDevice *impl_device,
+                                        MetaKmsCrtc       *crtc)
+ {
++  MetaKmsImplDevicePrivate *priv =
++    meta_kms_impl_device_get_instance_private (impl_device);
+   CrtcFrame *crtc_frame;
+ 
++  /* 拼接整屏视图的 tile CRTC（例如光标移到了该 tile 上）由 leader 统一提交。 */
++  crtc = meta_kms_device_get_crtc_latch_leader (priv->device, crtc);
+   crtc_frame = ensure_crtc_frame (impl_device, crtc);
+ 
+   if (crtc_frame->await_flush)
+@@ -2413,9 +2512,6 @@ meta_kms_impl_device_schedule_process (M
+ 
+   if (crtc_frame->pending_update)
+     {
+-      MetaKmsImplDevicePrivate *priv =
+-        meta_kms_impl_device_get_instance_private (impl_device);
+-
+       g_warning_once ("crtc_frame->pending_update=%p, deadline_timer_state=%d",
+                       crtc_frame->pending_update, priv->deadline_timer_state);
+     }
+--- a/src/backends/native/meta-kms-update.c
++++ b/src/backends/native/meta-kms-update.c
+@@ -25,6 +25,7 @@
+ #include "backends/meta-display-config-shared.h"
+ #include "backends/native/meta-kms-connector.h"
+ #include "backends/native/meta-kms-crtc.h"
++#include "backends/native/meta-kms-device-private.h"
+ #include "backends/native/meta-kms-impl-device.h"
+ #include "backends/native/meta-kms-mode-private.h"
+ #include "backends/native/meta-kms-plane.h"
+@@ -266,6 +267,9 @@ static void
+ update_latch_crtc (MetaKmsUpdate *update,
+                    MetaKmsCrtc   *crtc)
+ {
++  /* 拼接显示器的各 tile CRTC 锁存到同一个 leader，整组只算一个 CRTC。 */
++  crtc = meta_kms_device_get_crtc_latch_leader (update->device, crtc);
++
+   if (update->is_latchable)
+     {
+       if (update->latch_crtc)
+--- a/src/backends/native/meta-onscreen-native.c
++++ b/src/backends/native/meta-onscreen-native.c
+@@ -120,6 +120,17 @@ typedef struct _KmsProperty
+   gulong signal_handler_id;
+ } KmsProperty;
+ 
++/* 拼接显示器整屏缓冲中由某个 CRTC 扫描输出的区域（x, y 为缓冲内像素坐标）。 */
++typedef struct _MetaOnscreenNativeTile
++{
++  MetaCrtc *crtc;
++  MetaOutput *output;
++  int x;
++  int y;
++  gulong gamma_lut_handler_id;
++  gulong privacy_screen_handler_id;
++} MetaOnscreenNativeTile;
++
+ struct _MetaOnscreenNative
+ {
+   CoglOnscreenEgl parent;
+@@ -129,6 +140,10 @@ struct _MetaOnscreenNative
+   MetaOutput *output;
+   MetaCrtc *crtc;
+ 
++  /* 拼接显示器整屏视图：一块缓冲由这些 tile CRTC（含 crtc）分区扫描输出，
++   * 在同一次原子提交中翻帧。普通视图为 NULL。 */
++  GArray *tiles;
++
+   MetaOnscreenNativeSecondaryGpuState *secondary_gpu_state;
+ 
+   ClutterFrame *presented_frame;
+@@ -833,6 +848,46 @@ meta_onscreen_native_flip_crtc (CoglOnsc
+ 
+       scanout = meta_frame_native_get_scanout (frame_native);
+ 
++      if (onscreen_native->tiles && !scanout)
++        {
++          unsigned int i;
++
++          /* 同一块整屏缓冲由各 tile CRTC 分区扫描，放进同一次原子提交。 */
++          for (i = 0; i < onscreen_native->tiles->len; i++)
++            {
++              MetaOnscreenNativeTile *tile =
++                &g_array_index (onscreen_native->tiles,
++                                MetaOnscreenNativeTile, i);
++              const MetaCrtcConfig *tile_config =
++                meta_crtc_get_config (tile->crtc);
++              const MetaCrtcModeInfo *tile_mode_info;
++
++              if (!tile_config)
++                continue;
++
++              tile_mode_info = meta_crtc_mode_get_info (tile_config->mode);
++              src_rect = GRAPHENE_RECT_INIT (tile->x, tile->y,
++                                             tile_mode_info->width,
++                                             tile_mode_info->height);
++              dst_rect = (MtkRectangle) {
++                .width = tile_mode_info->width,
++                .height = tile_mode_info->height,
++              };
++
++              plane_assignment = assign_primary_plane (META_CRTC_KMS (tile->crtc),
++                                                       buffer,
++                                                       kms_update,
++                                                       flags,
++                                                       &src_rect,
++                                                       &dst_rect);
++
++              if (region && !mtk_region_is_empty (region))
++                meta_kms_plane_assignment_set_fb_damage (plane_assignment,
++                                                         region);
++            }
++          break;
++        }
++
+       if (scanout)
+         {
+           cogl_scanout_get_src_rect (scanout, &src_rect);
+@@ -1053,6 +1108,25 @@ meta_onscreen_native_set_crtc_mode (Cogl
+ #endif
+     }
+ 
++  if (onscreen_native->tiles)
++    {
++      unsigned int i;
++
++      for (i = 0; i < onscreen_native->tiles->len; i++)
++        {
++          MetaOnscreenNativeTile *tile =
++            &g_array_index (onscreen_native->tiles, MetaOnscreenNativeTile, i);
++          MetaOutputKms *tile_output_kms = META_OUTPUT_KMS (tile->output);
++
++          meta_crtc_kms_set_mode (META_CRTC_KMS (tile->crtc), kms_update);
++          set_underscan (tile_output_kms, kms_update);
++          set_max_bpc (tile_output_kms, kms_update);
++          set_rgb_range (tile_output_kms, kms_update);
++          set_color_mode (tile_output_kms, kms_update);
++        }
++      return;
++    }
++
+   meta_crtc_kms_set_mode (crtc_kms, kms_update);
+   set_underscan (META_OUTPUT_KMS (onscreen_native->output), kms_update);
+   set_max_bpc (META_OUTPUT_KMS (onscreen_native->output), kms_update);
+@@ -2118,6 +2192,10 @@ meta_onscreen_native_is_buffer_scanout_c
+   graphene_rect_t src_rect;
+   MtkRectangle dst_rect;
+ 
++  /* 整屏缓冲要由多个 tile CRTC 分区扫描，客户端缓冲不能直接上屏。 */
++  if (onscreen_native->tiles)
++    return FALSE;
++
+   gpu_kms = META_GPU_KMS (meta_crtc_get_gpu (crtc));
+   kms_device = meta_gpu_kms_get_kms_device (gpu_kms);
+   kms_crtc = meta_crtc_kms_get_kms_crtc (crtc_kms);
+@@ -2351,8 +2429,31 @@ meta_onscreen_native_prepare_frame (Cogl
+       kms_update = meta_frame_native_ensure_kms_update (frame_native,
+                                                         kms_device);
+ 
+-      gamma = meta_crtc_kms_peek_gamma_lut (crtc_kms);
+-      meta_kms_update_set_crtc_gamma (kms_update, kms_crtc, gamma);
++      if (onscreen_native->tiles)
++        {
++          unsigned int i;
++
++          for (i = 0; i < onscreen_native->tiles->len; i++)
++            {
++              MetaOnscreenNativeTile *tile =
++                &g_array_index (onscreen_native->tiles,
++                                MetaOnscreenNativeTile, i);
++              MetaCrtcKms *tile_crtc_kms = META_CRTC_KMS (tile->crtc);
++
++              if (meta_crtc_get_gamma_lut_size (tile->crtc) == 0)
++                continue;
++
++              gamma = meta_crtc_kms_peek_gamma_lut (tile_crtc_kms);
++              meta_kms_update_set_crtc_gamma (kms_update,
++                                              meta_crtc_kms_get_kms_crtc (tile_crtc_kms),
++                                              gamma);
++            }
++        }
++      else
++        {
++          gamma = meta_crtc_kms_peek_gamma_lut (crtc_kms);
++          meta_kms_update_set_crtc_gamma (kms_update, kms_crtc, gamma);
++        }
+       onscreen_native->property.gamma_lut.invalidated = FALSE;
+       onscreen_native->property.gamma_lut.target_frame_counter =
+         target_frame_counter;
+@@ -2368,8 +2469,30 @@ meta_onscreen_native_prepare_frame (Cogl
+       kms_update = meta_frame_native_ensure_kms_update (frame_native,
+                                                         kms_device);
+ 
+-      enabled = meta_output_is_privacy_screen_enabled (onscreen_native->output);
+-      meta_kms_update_set_privacy_screen (kms_update, kms_connector, enabled);
++      if (onscreen_native->tiles)
++        {
++          unsigned int i;
++
++          for (i = 0; i < onscreen_native->tiles->len; i++)
++            {
++              MetaOnscreenNativeTile *tile =
++                &g_array_index (onscreen_native->tiles,
++                                MetaOnscreenNativeTile, i);
++
++              if (!meta_output_get_info (tile->output)->supports_privacy_screen)
++                continue;
++
++              enabled = meta_output_is_privacy_screen_enabled (tile->output);
++              meta_kms_update_set_privacy_screen (kms_update,
++                                                  meta_output_kms_get_kms_connector (META_OUTPUT_KMS (tile->output)),
++                                                  enabled);
++            }
++        }
++      else
++        {
++          enabled = meta_output_is_privacy_screen_enabled (onscreen_native->output);
++          meta_kms_update_set_privacy_screen (kms_update, kms_connector, enabled);
++        }
+       onscreen_native->property.privacy_screen.invalidated = FALSE;
+       onscreen_native->property.privacy_screen.target_frame_counter =
+         target_frame_counter;
+@@ -2437,6 +2560,25 @@ meta_onscreen_native_finish_frame (CoglO
+   onscreen_native->needs_flush |= meta_kms_device_handle_flush (kms_device,
+                                                                 kms_crtc);
+ 
++  if (onscreen_native->tiles)
++    {
++      unsigned int i;
++
++      for (i = 0; i < onscreen_native->tiles->len; i++)
++        {
++          MetaOnscreenNativeTile *tile =
++            &g_array_index (onscreen_native->tiles, MetaOnscreenNativeTile, i);
++          MetaKmsCrtc *tile_kms_crtc =
++            meta_crtc_kms_get_kms_crtc (META_CRTC_KMS (tile->crtc));
++
++          if (tile_kms_crtc != kms_crtc)
++            {
++              onscreen_native->needs_flush |=
++                meta_kms_device_handle_flush (kms_device, tile_kms_crtc);
++            }
++        }
++    }
++
+   if (!meta_frame_native_has_kms_update (frame_native))
+     {
+       if (!onscreen_native->needs_flush ||
+@@ -3426,10 +3568,23 @@ meta_onscreen_native_invalidate (MetaOns
+   const MetaOutputInfo *output_info =
+     meta_output_get_info (onscreen_native->output);
+ 
++  unsigned int i;
++
+   if (meta_crtc_get_gamma_lut_size (onscreen_native->crtc) > 0)
+     onscreen_native->property.gamma_lut.invalidated = TRUE;
+   if (output_info->supports_privacy_screen)
+     onscreen_native->property.privacy_screen.invalidated = TRUE;
++
++  for (i = 0; onscreen_native->tiles && i < onscreen_native->tiles->len; i++)
++    {
++      MetaOnscreenNativeTile *tile =
++        &g_array_index (onscreen_native->tiles, MetaOnscreenNativeTile, i);
++
++      if (meta_crtc_get_gamma_lut_size (tile->crtc) > 0)
++        onscreen_native->property.gamma_lut.invalidated = TRUE;
++      if (meta_output_get_info (tile->output)->supports_privacy_screen)
++        onscreen_native->property.privacy_screen.invalidated = TRUE;
++    }
+ }
+ 
+ static void
+@@ -3503,13 +3658,73 @@ meta_onscreen_native_new (MetaRendererNa
+   return onscreen_native;
+ }
+ 
++/*
++ * 把整屏缓冲中 (x, y) 起、与该 CRTC 模式同尺寸的区域交给 crtc 扫描输出。
++ * 拼接显示器的每个 tile（含 leader 自身）各登记一次。
++ */
++void
++meta_onscreen_native_add_tile (MetaOnscreenNative *onscreen_native,
++                               MetaCrtc           *crtc,
++                               MetaOutput         *output,
++                               int                 x,
++                               int                 y)
++{
++  MetaOnscreenNativeTile tile = {
++    .crtc = g_object_ref (crtc),
++    .output = g_object_ref (output),
++    .x = x,
++    .y = y,
++  };
++
++  if (!onscreen_native->tiles)
++    {
++      onscreen_native->tiles = g_array_new (FALSE, FALSE,
++                                            sizeof (MetaOnscreenNativeTile));
++    }
++
++  /* leader 的信号已在 meta_onscreen_native_new() 中连接。 */
++  if (crtc != onscreen_native->crtc)
++    {
++      if (meta_crtc_get_gamma_lut_size (crtc) > 0)
++        {
++          onscreen_native->property.gamma_lut.invalidated = TRUE;
++          tile.gamma_lut_handler_id =
++            g_signal_connect (crtc, "gamma-lut-changed",
++                              G_CALLBACK (on_gamma_lut_changed),
++                              onscreen_native);
++        }
++
++      if (meta_output_get_info (output)->supports_privacy_screen)
++        {
++          onscreen_native->property.privacy_screen.invalidated = TRUE;
++          tile.privacy_screen_handler_id =
++            g_signal_connect (output, "notify::is-privacy-screen-enabled",
++                              G_CALLBACK (on_privacy_screen_enabled_changed),
++                              onscreen_native);
++        }
++    }
++
++  g_array_append_val (onscreen_native->tiles, tile);
++}
++
+ static void
+ clear_invalidation_handlers (MetaOnscreenNative *onscreen_native)
+ {
++  unsigned int i;
++
+   g_clear_signal_handler (&onscreen_native->property.gamma_lut.signal_handler_id,
+                           onscreen_native->crtc);
+   g_clear_signal_handler (&onscreen_native->property.privacy_screen.signal_handler_id,
+                           onscreen_native->output);
++
++  for (i = 0; onscreen_native->tiles && i < onscreen_native->tiles->len; i++)
++    {
++      MetaOnscreenNativeTile *tile =
++        &g_array_index (onscreen_native->tiles, MetaOnscreenNativeTile, i);
++
++      g_clear_signal_handler (&tile->gamma_lut_handler_id, tile->crtc);
++      g_clear_signal_handler (&tile->privacy_screen_handler_id, tile->output);
++    }
+ }
+ 
+ static void
+@@ -3567,6 +3782,24 @@ meta_onscreen_native_dispose (GObject *o
+ 
+   g_clear_object (&onscreen_native->output);
+   g_clear_object (&onscreen_native->crtc);
++
++  if (onscreen_native->tiles)
++    {
++      unsigned int i;
++
++      for (i = 0; i < onscreen_native->tiles->len; i++)
++        {
++          MetaOnscreenNativeTile *tile =
++            &g_array_index (onscreen_native->tiles, MetaOnscreenNativeTile, i);
++
++          g_clear_signal_handler (&tile->gamma_lut_handler_id, tile->crtc);
++          g_clear_signal_handler (&tile->privacy_screen_handler_id,
++                                  tile->output);
++          g_clear_object (&tile->crtc);
++          g_clear_object (&tile->output);
++        }
++      g_clear_pointer (&onscreen_native->tiles, g_array_unref);
++    }
+ }
+ 
+ static void
+--- a/src/backends/native/meta-onscreen-native.h
++++ b/src/backends/native/meta-onscreen-native.h
+@@ -62,6 +62,12 @@ MetaOnscreenNative * meta_onscreen_nativ
+ META_EXPORT_TEST
+ MetaCrtc * meta_onscreen_native_get_crtc (MetaOnscreenNative *onscreen_native);
+ 
++void meta_onscreen_native_add_tile (MetaOnscreenNative *onscreen_native,
++                                    MetaCrtc           *crtc,
++                                    MetaOutput         *output,
++                                    int                 x,
++                                    int                 y);
++
+ void meta_onscreen_native_invalidate (MetaOnscreenNative *onscreen_native);
+ 
+ void meta_onscreen_native_detach (MetaOnscreenNative *onscreen_native);
+--- a/src/backends/native/meta-renderer-native.c
++++ b/src/backends/native/meta-renderer-native.c
+@@ -58,6 +58,7 @@
+ #include "backends/native/meta-device-pool.h"
+ #include "backends/native/meta-kms-cursor-manager.h"
+ #include "backends/native/meta-kms-device.h"
++#include "backends/native/meta-kms-device-private.h"
+ #include "backends/native/meta-kms-plane.h"
+ #include "backends/native/meta-kms-utils.h"
+ #include "backends/native/meta-kms.h"
+@@ -1339,6 +1340,9 @@ meta_renderer_native_queue_modes_reset (
+           float view_scale;
+           MetaKmsCrtcLayout crtc_layout;
+ 
++          GList *tile_crtcs =
++            meta_renderer_view_get_tile_crtcs (META_RENDERER_VIEW (stage_view));
++
+           crtc = meta_onscreen_native_get_crtc (onscreen_native);
+           crtc_kms = META_CRTC_KMS (crtc);
+ 
+@@ -1348,16 +1352,43 @@ meta_renderer_native_queue_modes_reset (
+           clutter_stage_view_get_layout (stage_view, &view_layout);
+           view_scale = clutter_stage_view_get_scale (stage_view);
+ 
+-          crtc_layout = (MetaKmsCrtcLayout) {
+-            .crtc = kms_crtc,
+-            .cursor_plane = kms_plane,
+-            .layout = GRAPHENE_RECT_INIT (view_layout.x,
+-                                          view_layout.y,
+-                                          view_layout.width,
+-                                          view_layout.height),
+-            .scale = view_scale,
+-          };
+-          g_array_append_val (crtc_layouts, crtc_layout);
++          if (tile_crtcs)
++            {
++              GList *t;
++
++              /* 整屏视图的每个 tile CRTC 只显示自己的区域，光标按各自布局换算。 */
++              for (t = tile_crtcs; t; t = t->next)
++                {
++                  MetaCrtcKms *tile_crtc_kms = META_CRTC_KMS (t->data);
++                  const MetaCrtcConfig *tile_config =
++                    meta_crtc_get_config (t->data);
++
++                  if (!tile_config)
++                    continue;
++
++                  crtc_layout = (MetaKmsCrtcLayout) {
++                    .crtc = meta_crtc_kms_get_kms_crtc (tile_crtc_kms),
++                    .cursor_plane =
++                      meta_crtc_kms_get_assigned_cursor_plane (tile_crtc_kms),
++                    .layout = tile_config->layout,
++                    .scale = view_scale,
++                  };
++                  g_array_append_val (crtc_layouts, crtc_layout);
++                }
++            }
++          else
++            {
++              crtc_layout = (MetaKmsCrtcLayout) {
++                .crtc = kms_crtc,
++                .cursor_plane = kms_plane,
++                .layout = GRAPHENE_RECT_INIT (view_layout.x,
++                                              view_layout.y,
++                                              view_layout.width,
++                                              view_layout.height),
++                .scale = view_scale,
++              };
++              g_array_append_val (crtc_layouts, crtc_layout);
++            }
+ 
+           meta_onscreen_native_invalidate (onscreen_native);
+           renderer_native->pending_mode_set_views =
+@@ -1501,6 +1532,148 @@ should_force_shadow_fb (MetaRendererNati
+   return meta_kms_device_prefers_shadow_buffer (kms_device);
+ }
+ 
++typedef struct _TileGroupTile
++{
++  MetaCrtc *crtc;
++  MetaOutput *output;
++  int x;
++  int y;
++} TileGroupTile;
++
++typedef struct _TileGroup
++{
++  GArray *tiles;
++  int width;
++  int height;
++  MetaCrtc *leader_crtc;
++  MetaOutput *leader_output;
++  graphene_rect_t layout;
++} TileGroup;
++
++static gboolean
++collect_tile (MetaMonitor          *monitor,
++              MetaMonitorMode      *mode,
++              MetaMonitorCrtcMode  *monitor_crtc_mode,
++              gpointer              user_data,
++              GError              **error)
++{
++  GArray *tiles = user_data;
++  TileGroupTile tile = {
++    .output = monitor_crtc_mode->output,
++    .crtc = meta_output_get_assigned_crtc (monitor_crtc_mode->output),
++  };
++
++  meta_monitor_calculate_crtc_pos (monitor, mode, tile.output,
++                                   MTK_MONITOR_TRANSFORM_NORMAL,
++                                   &tile.x, &tile.y);
++  g_array_append_val (tiles, tile);
++
++  return TRUE;
++}
++
++/*
++ * 拼接显示器（DisplayID tiled，多路 DP）由多个 CRTC 拼成一块物理屏。若每个
++ * CRTC 各有一个视图，各 tile 分别绘制、分别提交：客户端可能在两次绘制之间
++ * 提交新帧，两次提交也可能落在不同 vblank，中缝两侧便会错开一帧。满足条件时
++ * 改用一个整屏视图：一次绘制、一次原子提交驱动全部 tile CRTC。
++ * 设置 MUTTER_DEBUG_DISABLE_TILED_VIEWS=1 可退回每个 CRTC 一个视图。
++ */
++static gboolean
++get_tile_group (MetaRendererNative *renderer_native,
++                MetaLogicalMonitor *logical_monitor,
++                MetaMonitor        *monitor,
++                MetaCrtc           *crtc,
++                TileGroup          *group)
++{
++  MetaGpuKms *primary_gpu_kms = renderer_native->primary_gpu_kms;
++  MetaRendererNativeGpuData *renderer_gpu_data;
++  MetaMonitorMode *mode;
++  float refresh_rate = 0.0;
++  gboolean has_crtc = FALSE;
++  gboolean has_leader = FALSE;
++  unsigned int i;
++
++  if (g_strcmp0 (g_getenv ("MUTTER_DEBUG_DISABLE_TILED_VIEWS"), "1") == 0)
++    return FALSE;
++
++  if (!monitor || !META_IS_MONITOR_TILED (monitor) || !META_IS_CRTC_KMS (crtc))
++    return FALSE;
++
++  if (!meta_kms_device_uses_atomic_modesetting (
++        meta_kms_crtc_get_device (meta_crtc_kms_get_kms_crtc (META_CRTC_KMS (crtc)))))
++    return FALSE;
++
++  if (meta_logical_monitor_get_transform (logical_monitor) !=
++      MTK_MONITOR_TRANSFORM_NORMAL)
++    return FALSE;
++
++  renderer_gpu_data = meta_renderer_native_get_gpu_data (renderer_native,
++                                                         primary_gpu_kms);
++  if (!renderer_gpu_data ||
++      renderer_gpu_data->mode != META_RENDERER_NATIVE_MODE_GBM)
++    return FALSE;
++
++  mode = meta_monitor_get_current_mode (monitor);
++  if (!mode)
++    return FALSE;
++
++  group->tiles = g_array_new (FALSE, FALSE, sizeof (TileGroupTile));
++  meta_monitor_mode_foreach_crtc (monitor, mode, collect_tile,
++                                  group->tiles, NULL);
++  if (group->tiles->len < 2)
++    goto not_grouped;
++
++  meta_monitor_mode_get_resolution (mode, &group->width, &group->height);
++  group->leader_output = meta_monitor_get_main_output (monitor);
++  group->leader_crtc = meta_output_get_assigned_crtc (group->leader_output);
++
++  for (i = 0; i < group->tiles->len; i++)
++    {
++      TileGroupTile *tile = &g_array_index (group->tiles, TileGroupTile, i);
++      const MetaCrtcConfig *config;
++      const MetaCrtcModeInfo *mode_info;
++
++      if (!tile->crtc || !META_IS_CRTC_KMS (tile->crtc) ||
++          META_GPU_KMS (meta_crtc_get_gpu (tile->crtc)) != primary_gpu_kms)
++        goto not_grouped;
++
++      config = meta_crtc_get_config (tile->crtc);
++      if (!config || config->transform != MTK_MONITOR_TRANSFORM_NORMAL)
++        goto not_grouped;
++
++      if (meta_output_is_vrr_enabled (tile->output))
++        goto not_grouped;
++
++      mode_info = meta_crtc_mode_get_info (config->mode);
++      if (i == 0)
++        refresh_rate = mode_info->refresh_rate;
++      else if (mode_info->refresh_rate != refresh_rate)
++        goto not_grouped;
++
++      if (tile->x < 0 || tile->y < 0 ||
++          tile->x + mode_info->width > group->width ||
++          tile->y + mode_info->height > group->height)
++        goto not_grouped;
++
++      if (i == 0)
++        group->layout = config->layout;
++      else
++        graphene_rect_union (&group->layout, &config->layout, &group->layout);
++
++      has_crtc |= tile->crtc == crtc;
++      has_leader |= tile->crtc == group->leader_crtc;
++    }
++
++  if (!has_crtc || !has_leader)
++    goto not_grouped;
++
++  return TRUE;
++
++not_grouped:
++  g_clear_pointer (&group->tiles, g_array_unref);
++  return FALSE;
++}
++
+ static MetaRendererView *
+ meta_renderer_native_create_view (MetaRenderer        *renderer,
+                                   MetaLogicalMonitor  *logical_monitor,
+@@ -1531,12 +1704,28 @@ meta_renderer_native_create_view (MetaRe
+   MetaRendererViewNative *view_native;
+   EGLSurface egl_surface;
+   GError *local_error = NULL;
++  TileGroup tile_group = { 0 };
++  gboolean is_tile_group;
++
++  is_tile_group = get_tile_group (renderer_native, logical_monitor, monitor,
++                                  crtc, &tile_group);
++  if (is_tile_group)
++    {
++      crtc = tile_group.leader_crtc;
++      output = tile_group.leader_output;
++    }
+ 
+   crtc_config = meta_crtc_get_config (crtc);
+   crtc_mode_info = meta_crtc_mode_get_info (crtc_config->mode);
+   onscreen_width = crtc_mode_info->width;
+   onscreen_height = crtc_mode_info->height;
+ 
++  if (is_tile_group)
++    {
++      onscreen_width = tile_group.width;
++      onscreen_height = tile_group.height;
++    }
++
+   if (META_IS_CRTC_KMS (crtc))
+     {
+       MetaGpuKms *gpu_kms = META_GPU_KMS (meta_crtc_get_gpu (crtc));
+@@ -1550,6 +1739,7 @@ meta_renderer_native_create_view (MetaRe
+                                       "Failed to create secondary GPU data for %s: ",
+                                       meta_gpu_kms_get_file_path (gpu_kms));
+ 
++          g_clear_pointer (&tile_group.tiles, g_array_unref);
+           return NULL;
+         }
+       else
+@@ -1564,11 +1754,27 @@ meta_renderer_native_create_view (MetaRe
+                                                       onscreen_width,
+                                                       onscreen_height);
+ 
++          if (is_tile_group)
++            {
++              unsigned int i;
++
++              for (i = 0; i < tile_group.tiles->len; i++)
++                {
++                  TileGroupTile *tile =
++                    &g_array_index (tile_group.tiles, TileGroupTile, i);
++
++                  meta_onscreen_native_add_tile (onscreen_native,
++                                                 tile->crtc, tile->output,
++                                                 tile->x, tile->y);
++                }
++            }
++
+           if (!cogl_framebuffer_allocate (COGL_FRAMEBUFFER (onscreen_native), &local_error))
+             {
+               g_propagate_prefixed_error (error, local_error,
+                                           "Failed to allocate onscreen framebuffer for %s: ",
+                                           meta_gpu_kms_get_file_path (gpu_kms));
++              g_clear_pointer (&tile_group.tiles, g_array_unref);
+               return NULL;
+             }
+           else
+@@ -1605,7 +1811,8 @@ meta_renderer_native_create_view (MetaRe
+   else
+     scale = 1.0;
+ 
+-  mtk_rectangle_from_graphene_rect (&crtc_config->layout,
++  mtk_rectangle_from_graphene_rect (is_tile_group ? &tile_group.layout
++                                                  : &crtc_config->layout,
+                                     MTK_ROUNDING_STRATEGY_ROUND,
+                                     &view_layout);
+ 
+@@ -1624,6 +1831,38 @@ meta_renderer_native_create_view (MetaRe
+                               "vblank-duration-us", crtc_mode_info->vblank_duration_us,
+                               NULL);
+ 
++  if (is_tile_group)
++    {
++      MetaKmsCrtc *leader_kms_crtc =
++        meta_crtc_kms_get_kms_crtc (META_CRTC_KMS (crtc));
++      MetaKmsDevice *kms_device = meta_kms_crtc_get_device (leader_kms_crtc);
++      GList *tile_crtcs = NULL;
++      unsigned int i;
++
++      for (i = 0; i < tile_group.tiles->len; i++)
++        {
++          TileGroupTile *tile = &g_array_index (tile_group.tiles,
++                                                TileGroupTile, i);
++          MetaKmsCrtc *tile_kms_crtc =
++            meta_crtc_kms_get_kms_crtc (META_CRTC_KMS (tile->crtc));
++
++          tile_crtcs = g_list_append (tile_crtcs, tile->crtc);
++          meta_kms_device_set_crtc_latch_leader (kms_device, tile_kms_crtc,
++                                                 leader_kms_crtc);
++        }
++
++      meta_renderer_view_set_tile_crtcs (META_RENDERER_VIEW (view_native),
++                                         tile_crtcs);
++      g_list_free (tile_crtcs);
++
++      meta_topic (META_DEBUG_KMS,
++                  "Rendering tiled monitor %s as one %dx%d view on %u CRTCs",
++                  meta_output_get_name (output),
++                  onscreen_width, onscreen_height, tile_group.tiles->len);
++
++      g_clear_pointer (&tile_group.tiles, g_array_unref);
++    }
++
+   if (META_IS_ONSCREEN_NATIVE (framebuffer))
+     {
+       CoglDisplayEGL *cogl_display_egl;
+@@ -1696,6 +1935,7 @@ meta_renderer_native_rebuild_views (Meta
+   MetaKms *kms = meta_backend_native_get_kms (backend_native);
+   MetaRendererClass *parent_renderer_class =
+     META_RENDERER_CLASS (meta_renderer_native_parent_class);
++  GList *l;
+ 
+   discard_pending_swaps (renderer);
+   meta_kms_discard_pending_page_flips (kms);
+@@ -1703,6 +1943,10 @@ meta_renderer_native_rebuild_views (Meta
+ 
+   detach_onscreens (renderer);
+ 
++  /* 拼接显示器的整屏视图会在重建时重新登记各 tile CRTC 的锁存关系。 */
++  for (l = meta_kms_get_devices (kms); l; l = l->next)
++    meta_kms_device_clear_crtc_latch_leaders (l->data);
++
+   parent_renderer_class->rebuild_views (renderer);
+ 
+   meta_renderer_native_queue_modes_reset (META_RENDERER_NATIVE (renderer));
+--- a/src/compositor/meta-compositor-view-native.c
++++ b/src/compositor/meta-compositor-view-native.c
+@@ -281,6 +281,13 @@ find_scanout_candidate (MetaCompositorVi
+       return FALSE;
+     }
+ 
++  if (meta_renderer_view_get_tile_crtcs (renderer_view))
++    {
++      meta_topic (META_DEBUG_RENDER,
++                  "No direct scanout candidate: view spans tiled CRTCs");
++      return FALSE;
++    }
++
+   framebuffer = clutter_stage_view_get_onscreen (stage_view);
+   if (!COGL_IS_ONSCREEN (framebuffer))
+     {

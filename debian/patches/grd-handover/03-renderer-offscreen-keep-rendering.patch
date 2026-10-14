@@ -1,0 +1,87 @@
+Description: renderer: keep rendering offscreen virtual (gpu==NULL) views
+ .
+ Does not inhibit the frame clock for offscreen virtual views that drive no CRTC, so remote-desktop/screen-cast handover virtual monitors keep producing frames.
+Author: Geoffrey <altarscn2@gmail.com>
+Origin: downstream, GRD session-handover patch set
+Forwarded: not-needed
+Last-Update: 2026-06-04
+
+Index: mutter-50.1/src/backends/meta-renderer.c
+===================================================================
+--- mutter-50.1.orig/src/backends/meta-renderer.c
++++ mutter-50.1/src/backends/meta-renderer.c
+@@ -45,7 +45,9 @@
+ #include <glib-object.h>
+ 
+ #include "backends/meta-backend-private.h"
++#include "backends/meta-crtc.h"
+ #include "backends/meta-logical-monitor-private.h"
++#include "backends/meta-renderer-view.h"
+ 
+ enum
+ {
+@@ -261,6 +263,24 @@ meta_renderer_get_views_for_monitor (Met
+                                                                     monitor);
+ }
+ 
++static gboolean
++meta_renderer_view_renders_offscreen (ClutterStageView *stage_view)
++{
++  MetaCrtc *crtc;
++
++  if (!META_IS_RENDERER_VIEW (stage_view))
++    return FALSE;
++
++  crtc = meta_renderer_view_get_crtc (META_RENDERER_VIEW (stage_view));
++
++  /* Virtual CRTCs (e.g. for remote-desktop / screen-cast virtual monitors)
++   * have no GPU and render to an offscreen framebuffer instead of a physical
++   * display. Such views are not driven by a physical output, so they must keep
++   * producing frames even while the renderer is paused (e.g. when the session
++   * is VT-switched away), or screen-cast consumers would freeze. */
++  return crtc && meta_crtc_get_gpu (crtc) == NULL;
++}
++
+ void
+ meta_renderer_add_view (MetaRenderer     *renderer,
+                         MetaRendererView *view)
+@@ -269,7 +289,8 @@ meta_renderer_add_view (MetaRenderer
+ 
+   priv->views = g_list_append (priv->views, view);
+ 
+-  if (priv->is_paused)
++  if (priv->is_paused &&
++      !meta_renderer_view_renders_offscreen (CLUTTER_STAGE_VIEW (view)))
+     {
+       ClutterFrameClock *frame_clock =
+         clutter_stage_view_get_frame_clock (CLUTTER_STAGE_VIEW (view));
+@@ -308,9 +329,12 @@ meta_renderer_pause (MetaRenderer *rende
+   for (l = priv->views; l; l = l->next)
+     {
+       ClutterStageView *stage_view = l->data;
+-      ClutterFrameClock *frame_clock =
+-        clutter_stage_view_get_frame_clock (stage_view);
++      ClutterFrameClock *frame_clock;
+ 
++      if (meta_renderer_view_renders_offscreen (stage_view))
++        continue;
++
++      frame_clock = clutter_stage_view_get_frame_clock (stage_view);
+       clutter_frame_clock_inhibit (frame_clock);
+     }
+ }
+@@ -328,9 +352,12 @@ meta_renderer_resume (MetaRenderer *rend
+   for (l = priv->views; l; l = l->next)
+     {
+       ClutterStageView *stage_view = l->data;
+-      ClutterFrameClock *frame_clock =
+-        clutter_stage_view_get_frame_clock (stage_view);
++      ClutterFrameClock *frame_clock;
++
++      if (meta_renderer_view_renders_offscreen (stage_view))
++        continue;
+ 
++      frame_clock = clutter_stage_view_get_frame_clock (stage_view);
+       clutter_frame_clock_uninhibit (frame_clock);
+     }
+ 

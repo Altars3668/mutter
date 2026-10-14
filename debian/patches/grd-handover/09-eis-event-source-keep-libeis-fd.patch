@@ -1,0 +1,28 @@
+Description: EIS 事件源释放时不再关闭 libeis 拥有的 epoll fd
+ eis_get_fd() 返回 libeis 内部 sink 的 epoll fd，所有权在 libeis，
+ eis_unref() 销毁上下文时自己会关闭它。meta_eis_dispose() 先经
+ meta_event_source_free() 关一次，销毁 EIS 客户端后再经 eis_unref() 关
+ 第二次。第一次释放的编号若在两次之间被别的线程分配走，第二次 close
+ 关掉的就是别人的文件。
+ 每次带 EIS 的远程会话 Stop 都会走到这里。物理登录接管远程会话时，座席
+ 切回本会话，输入线程恰在同一时刻 reclaim 设备、libudev 连续打开 /sys
+ 目录，拿到这个编号后被 libeis 关掉；libudev 自己的 safe_close() 得到
+ EBADF 触发断言，gnome-shell abort，整个会话随之注销。
+Origin: downstream, GRD session-handover patch set
+Forwarded: no
+Last-Update: 2026-10-10
+
+--- a/src/backends/meta-eis.c
++++ b/src/backends/meta-eis.c
+@@ -227,10 +227,7 @@
+ {
+   GSource *g_source = (GSource *) source;
+ 
+-  /* ignore the return value of close, it's not like we can do something
+-   * about it */
+-  close (source->event_poll_fd.fd);
+-
++  /* fd 是 eis_get_fd() 给的 libeis 内部 epoll fd，由 eis_unref() 关闭。 */
+   g_source_destroy (g_source);
+   g_source_unref (g_source);
+ }

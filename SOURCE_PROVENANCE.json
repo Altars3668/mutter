@@ -1,0 +1,11 @@
+{
+  "component": "mutter",
+  "source_package": "mutter",
+  "base_version": "50.1-0ubuntu2.4+altarscn3",
+  "upstream_archive": "mutter_50.1.orig.tar.xz",
+  "upstream_sha256": "9344502ce473f788795f26b45f8b8ff53c0a36b867470d705a11a3ee0911021e",
+  "downstream_commit": null,
+  "import_date": "2026-10-14",
+  "model": "quilt",
+  "note": "首次公开导入为源码快照；不包含私有历史、运行凭据或构建产物。"
+}
